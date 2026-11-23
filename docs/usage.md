@@ -8,6 +8,7 @@ yk-key add [-j]
 yk-key edit QUERY [-N|-F|-S] [-j]
 yk-key rm QUERY [-N|-F|-S] [-y] [-j]
 yk-key git [QUERY] [-g] [-n|-f|-s|-k] [-l LEN] [-j]
+yk-key completion [bash|zsh|fish]
 ```
 
 ## Commands
@@ -21,6 +22,7 @@ yk-key git [QUERY] [-g] [-n|-f|-s|-k] [-l LEN] [-j]
 | `edit` QUERY | Edit a key, asking for each field |
 | `rm`, `delete`, `remove` QUERY | Remove a key (asks first unless `-y` or `-q`) |
 | `git` [QUERY] | Show or set Git's `user.signingkey` |
+| `completion`, `completions` [SHELL] | Print the completion script for `bash`, `zsh` or `fish` (default: the shell named in `$SHELL`) |
 | `help` | Show the help (`-h`, `--help` too) |
 
 ## Options
@@ -96,7 +98,7 @@ Under bash on a terminal (Arch, Fedora and macOS ship bash as `sh`), the default
 shells it is shown in brackets and an empty answer keeps it. For the SSH key, `-` means none. Prompts go to stderr, so
 `--json` output stays clean; answers can also be piped in, one per line.
 
-An entry is refused when a field is missing, the fingerprint is not 40 hex characters, the name is a command name or looks
+An entry is refused when a field is missing, the fingerprint is not 40 hex characters, the name is a command name (including `completion`) or looks
 like a hex ID (8 or more hex characters), the name or SSH key path holds control characters, two fields are equal, or any
 field collides with another entry's name, fingerprint (full or last 16) or serial. A missing SSH key file only warns.
 
@@ -106,6 +108,12 @@ With no QUERY, shows the `user.signingkey` Git uses here, which config it comes 
 entry it belongs to; `-g` looks at the global config only. A trailing `!` (a pinned subkey) is ignored for the lookup. With a
 QUERY, sets `user.signingkey` to that entry's fingerprint in this repository's config, or with `-g` the global one; `-l`
 controls the length written.
+
+## completion
+
+Prints a completion script on stdout, for the shell to load. It needs neither jq nor a database. The scripts complete commands,
+options, `--length` values and shell names, and key names (with their long key ID and serial in zsh and fish), asking `yk-key`
+itself for them and honouring a `--db` already typed. Loading them is described in [install.md](install.md#completions).
 
 ## Output
 

@@ -8,7 +8,7 @@ name; anything left out uses that step's defaults.
 - `main` takes changes through PRs: branch first, then open a PR against `main`.
 
 ## doc-it
-- Keep `docs/usage.md`, the `--help` text, `help --json` and `completions/yk-key.fish` in step
+- Keep `docs/usage.md`, the `--help` text, `help --json` and the three completion scripts in `yk-key` in step
   with every change to commands or options.
 - Breaking issues beyond syntax errors: `shellcheck -s sh yk-key` failing, or anything that
   works only under bash outside the `ask` prompt.

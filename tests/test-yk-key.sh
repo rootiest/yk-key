@@ -354,6 +354,48 @@ yk git -g -n -q
 expect "git -g shows the global key" 0 "travel"
 cd "$ROOT" || exit 1
 
+# ---- completion ----------------------------------------------------------
+for shell in bash zsh fish; do
+  yk completion "$shell"
+  expect "completion $shell" 0
+  if command -v "$shell" >/dev/null 2>&1; then
+    printf '%s\n' "$out" | "$shell" -n 2>"$WORK/stderr" && ok || bad "completion $shell does not parse: $(cat "$WORK/stderr")"
+  fi
+done
+yk completions bash
+expect "completions is an alias" 0
+yk completion tcsh
+expect "completion: unknown shell" 2
+out=$(SHELL=/usr/bin/zsh YK_KEY_DB="$WORK/none.json" $YK_SH "$ROOT/yk-key" completion 2>/dev/null | sed -n 1p) st=$?
+expect "completion defaults to \$SHELL and needs no database" 0 "#compdef yk-key"
+yk_in "completion\n$FP_NEW\n55555555\n\n" add
+expect "completion cannot name a key" 1
+
+# The bash completion, driven as bash would drive it, with yk-key on PATH.
+if command -v bash >/dev/null 2>&1; then
+  mkdir -p "$WORK/bin"
+  printf '#!/bin/sh\nexec %s "%s" "$@"\n' "$YK_SH" "$ROOT/yk-key" >"$WORK/bin/yk-key"
+  chmod +x "$WORK/bin/yk-key"
+  comp_bash() {
+    out=$(PATH="$WORK/bin:$PATH" YK_KEY_DB=$DB bash -c '
+      source <(yk-key completion bash)
+      COMP_WORDS=("$@"); COMP_CWORD=$((${#COMP_WORDS[@]} - 1))
+      _yk_key; printf "%s\n" "${COMPREPLY[@]}"' bash "$@" | sort | tr '\n' ' ')
+    st=0
+  }
+  reset_db
+  comp_bash yk-key pr
+  expect "bash: key names" 0 "primary primary-backup "
+  comp_bash yk-key rm ""
+  expect "bash: keys after a query command" 0 "primary primary-backup secondary travel "
+  comp_bash yk-key rm primary ""
+  expect "bash: nothing after the QUERY" 0 " "
+  comp_bash yk-key completion ""
+  expect "bash: shells" 0 "bash fish zsh "
+  comp_bash yk-key --length ""
+  expect "bash: length values" 0 "full long short "
+fi
+
 # ---- missing jq ----------------------------------------------------------
 mkdir -p "$WORK/nojq"
 for t in sed tr grep cat mkdir dirname mktemp mv rm sh; do
@@ -363,6 +405,8 @@ out=$(PATH="$WORK/nojq" YK_KEY_DB=$DB "$WORK/nojq/sh" "$ROOT/yk-key" 2>"$WORK/st
 st=$? errout=$(cat "$WORK/stderr")
 expect "missing jq" 1
 expect_err "missing jq message" "jq is required"
+out=$(PATH="$WORK/nojq" "$WORK/nojq/sh" "$ROOT/yk-key" completion bash 2>/dev/null | sed -n 1p) st=$?
+expect "completion works without jq" 0 "# bash completion for yk-key. Load it with: source <(yk-key completion bash)"
 
 printf '%s passed, %s failed (yk-key run by %s)\n' "$pass" "$fail" "$YK_SH"
 [ "$fail" -eq 0 ]

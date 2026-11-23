@@ -11,7 +11,6 @@ if command -v shellcheck >/dev/null 2>&1; then
 else
   echo "run-tests: shellcheck not installed; skipped" >&2
 fi
-if command -v fish >/dev/null 2>&1; then fish -n completions/yk-key.fish; fi
 
 ran=0
 for shell in sh dash bash 'busybox sh'; do
