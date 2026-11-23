@@ -70,7 +70,8 @@ A JSON array, one object per key:
 4. otherwise `$YK_KEY_DB` if set, else the XDG path. Only `add` goes on from here: it creates the file (and its directory).
 
 Every write goes through a temporary file beside the database, renamed into place, so an interrupted write never leaves a
-half-written file. The new file is created mode 0600.
+half-written file. The new file is created mode 0600. When the database is a symlink, the file it points to is written and the
+link stays.
 
 ## Matching a QUERY
 

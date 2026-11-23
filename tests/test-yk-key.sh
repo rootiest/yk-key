@@ -288,6 +288,16 @@ yk_in "nova\nAAAAAAAAAAAAAAAAAAAAAAAA${FP_PRIMARY#AAAA1111BBBB2222CCCC3333}\n555
 expect "add rejects a long key ID collision" 1
 cmp -s "$DB" "$WORK/fixture.json" && ok || bad "rejected adds left the database alone"
 
+# ---- a symlinked database stays a symlink ----------------------------------
+mkdir -p "$WORK/linkdir" "$WORK/target"
+cp "$WORK/fixture.json" "$WORK/target/cards.json"
+ln -s ../target/cards.json "$WORK/linkdir/cards.json"
+printf 'nova\n%s\n55555555\n\n' "$FP_NEW" | YK_KEY_DB="$WORK/linkdir/cards.json" $YK_SH "$ROOT/yk-key" add -q >/dev/null 2>&1
+st=$? out='' errout=''
+expect "add through a symlink" 0
+[ -L "$WORK/linkdir/cards.json" ] && ok || bad "the symlink was replaced"
+jq -e '.[4].name == "nova"' "$WORK/target/cards.json" >/dev/null 2>&1 && ok || bad "the link target was written"
+
 # ---- edit ----------------------------------------------------------------
 reset_db
 yk_in "travel2\n\n\n$HOME/.ssh/c\n" edit travel

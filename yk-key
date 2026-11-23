@@ -281,16 +281,33 @@ match_one() {
 
 # write_db JQ_FILTER [JQ_ARGS]...: rewrite the database through jq, via a
 # temporary file beside it renamed into place, so an interrupted write never
-# leaves it half-written.
+# leaves it half-written. A symlinked database is written at its target, so
+# the link survives.
 write_db() {
   _filter=$1
   shift
-  _tmp=$(mktemp "$db_file.XXXXXX") || exit 1
-  if ! jq "$@" "$_filter" "$db_file" >"$_tmp" || ! mv -f -- "$_tmp" "$db_file"; then
+  _real=$(real_path "$db_file")
+  _tmp=$(mktemp "$_real.XXXXXX") || exit 1
+  if ! jq "$@" "$_filter" "$_real" >"$_tmp" || ! mv -f -- "$_tmp" "$_real"; then
     rm -f -- "$_tmp"
     err "yk-key: could not write $db_file"
     exit 1
   fi
+}
+
+# real_path PATH: PATH with symlinks followed (up to 40 deep), using only
+# plain readlink, which GNU, busybox, BSD and macOS all have.
+real_path() {
+  _r=$1 _i=0
+  while [ -L "$_r" ] && [ "$_i" -lt 40 ]; do
+    _l=$(readlink -- "$_r") || break
+    case $_l in
+      /*) _r=$_l ;;
+      *) _r="$(dirname -- "$_r")/$_l" ;;
+    esac
+    _i=$((_i + 1))
+  done
+  printf '%s\n' "$_r"
 }
 
 # validate IGNORE_NAME NAME FP SERIAL SSH: reject an entry before it is
