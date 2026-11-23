@@ -1,4 +1,4 @@
-# CI: runs the project's test suite on Gitea runners.
+# CI: runs the test suite on Gitea runners, under every POSIX shell it can install.
 # GitHub sees this file through the mirror; the guard skips it there.
 name: CI
 on:
@@ -11,5 +11,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Install tools
+        run: |
+          missing=""
+          for t in jq git shellcheck dash busybox; do
+            command -v "$t" >/dev/null 2>&1 || missing="$missing $t"
+          done
+          if [ -n "$missing" ]; then
+            sudo=$(command -v sudo || true)
+            $sudo apt-get update -qq
+            $sudo apt-get install -y -qq $missing
+          fi
       - name: Test
-        run: ./tests/run-tests.sh   # replace with the project's documented test command
+        run: ./tests/run-tests.sh

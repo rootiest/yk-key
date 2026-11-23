@@ -1,0 +1,6 @@
+[
+  {"name": "primary", "fingerprint": "AAAA1111BBBB2222CCCC3333DDDD4444EEEE5555", "serial": "11111111", "ssh-key": "/home/test/.ssh/id_ed25519_sk_primary"},
+  {"name": "secondary", "fingerprint": "0123456789ABCDEF0123456789ABCDEF01234567", "serial": "22222222", "ssh-key": "/home/test/.ssh/id_ed25519_sk_secondary"},
+  {"name": "travel", "fingerprint": "FEDCBA9876543210FEDCBA9876543210FEDCBA98", "serial": "33333333"},
+  {"name": "primary-backup", "fingerprint": "9999888877776666555544443333222211110000", "serial": "44444444"}
+]

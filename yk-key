@@ -1,0 +1,965 @@
+#!/bin/sh
+# Copyright (C) 2026 Rootiest
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# yk-key: manage YubiKey GPG signing keys and the Git signing key.
+#
+# A single POSIX sh script. It needs jq; `current` and `add` use gpg to read
+# the inserted card, and `git` needs git. Full documentation: docs/usage.md
+# in the yk-key repository, or `yk-key --help`.
+#
+# SYNOPSIS
+#   yk-key [list] [-n|-f|-s|-k] [-l LEN] [-j]
+#   yk-key [info|show] QUERY [-N|-F|-S] [-n|-f|-s|-k] [-l LEN] [-j]
+#   yk-key current [-n|-f|-s|-k] [-l LEN] [-j]
+#   yk-key add [-j]
+#   yk-key edit QUERY [-N|-F|-S] [-j]
+#   yk-key rm QUERY [-N|-F|-S] [-y] [-j]
+#   yk-key git [QUERY] [-g] [-n|-f|-s|-k] [-l LEN] [-j]
+#
+# EXIT STATUS
+#   0  Success, or help or the version was shown
+#   1  No match, an ambiguous match, no database, no card, no SSH key set
+#      (with -k, without --json), a missing dependency, a rejected entry, an
+#      aborted removal, or a failed write
+#   2  Unknown option, invalid --length, or a missing QUERY
+
+# SC2016: jq programs are single-quoted on purpose. SC2088: ~ is printed, not
+# expanded. SC2154: m_* are assigned by eval in yk_match.
+# shellcheck disable=SC2016,SC2088,SC2154
+YK_KEY_VERSION=1.0.0
+
+unset CDPATH
+tab=$(printf '\t')
+
+# ---------------------------------------------------------------- output ----
+
+# colors: set the palette, or blank it when colour is off.
+colors() {
+  if [ -n "${NO_COLOR-}" ]; then
+    c_reset='' c_cmd='' c_flag='' c_arg='' c_dim='' c_head=''
+    c_warn='' c_err='' c_ok='' c_accent='' c_hi=''
+    return 0
+  fi
+  e=$(printf '\033')
+  c_reset="${e}[0m" c_cmd="${e}[94m" c_flag="${e}[92m" c_arg="${e}[36m"
+  c_dim="${e}[90m" c_head="${e}[1;36m" c_warn="${e}[33m" c_err="${e}[31m"
+  c_ok="${e}[32m" c_accent="${e}[32m" c_hi="${e}[1;37m"
+}
+
+# err MSG: print an error in red on stderr, always.
+err() { printf '%s%s%s\n' "$c_err" "$1" "$c_reset" >&2; }
+
+# qerr MSG [COLOR]: print an error on stderr unless -q.
+qerr() {
+  [ "$is_silent" -eq 1 ] && return 0
+  printf '%s%s%s\n' "${2-$c_err}" "$1" "$c_reset" >&2
+}
+
+# tilde PATH: print PATH with a leading $HOME shown as ~.
+tilde() {
+  case $1 in
+    "$HOME"/*) printf '~/%s' "${1#"$HOME"/}" ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+# fmt_fp FINGERPRINT: print FINGERPRINT cut to $fp_len (the last 8 or 16
+# characters, or all of it).
+fmt_fp() {
+  case $fp_len in
+    short) printf '%s\n' "$1" | sed 's/^.*\(.\{8\}\)$/\1/' ;;
+    long) printf '%s\n' "$1" | sed 's/^.*\(.\{16\}\)$/\1/' ;;
+    *) printf '%s\n' "$1" ;;
+  esac
+}
+
+# emit_json FIELD NAME FP SERIAL SSH [KEY=VALUE]...: print one entry as a
+# JSON object. Extras come first; empty values become null. With a FIELD
+# other than all, the object holds only that key.
+emit_json() {
+  _f=$1 _n=$2 _p=$3 _s=$4 _k=$5
+  shift 5
+  jq -n --arg field "$_f" --arg n "$_n" --arg f "$_p" --arg s "$_s" --arg k "$_k" '
+    def nz: if . == "" then null else . end;
+    ([$ARGS.positional[] | index("=") as $i | {(.[:$i]): (.[$i + 1:] | nz)}] | add // {})
+      + {name: ($n | nz), fingerprint: ($f | nz), serial: ($s | nz), "ssh-key": ($k | nz)}
+    | if $field == "all" then . else {($field): .[$field]} end
+  ' --args "$@"
+}
+
+# print_entry COLOR NAME FP SERIAL SSH: the one-line form info and current
+# print for a key.
+print_entry() {
+  if [ "$is_silent" -eq 1 ]; then
+    printf '%s\t%s\t%s\t%s\n' "$2" "$3" "$4" "$5"
+    return 0
+  fi
+  printf '%s%s%s  %sfingerprint=%s%s%s  %sserial=%s%s%s' \
+    "$1" "$2" "$c_reset" "$c_dim" "$c_arg" "$3" "$c_reset" "$c_dim" "$c_accent" "$4" "$c_reset"
+  [ -n "$5" ] && printf '  %sssh-key=%s%s' "$c_dim" "$(tilde "$5")" "$c_reset"
+  echo
+}
+
+# print_field NAME FP SERIAL SSH: print the field chosen with -n/-f/-s/-k,
+# or the whole entry (in $c_hi). Returns 1 when -k finds no SSH key.
+print_field() {
+  case $out_field in
+    name) printf '%s\n' "$1" ;;
+    fingerprint) printf '%s\n' "$2" ;;
+    serial) printf '%s\n' "$3" ;;
+    ssh-key)
+      if [ -z "$4" ]; then
+        qerr "yk-key: '$1' has no SSH key set" "$c_warn"
+        return 1
+      fi
+      printf '%s\n' "$4"
+      ;;
+    *) print_entry "$c_hi" "$1" "$2" "$3" "$4" ;;
+  esac
+}
+
+# ------------------------------------------------------------------ help ----
+
+help_json() {
+  # The same content as help_text; keep them in step.
+  _json='{
+  "name": "yk-key",
+  "description": "Manage YubiKey GPG signing keys and the Git signing key",
+  "usage": "yk-key [COMMAND] [QUERY] [OPTIONS]",
+  "commands": [
+    {"name": "list", "aliases": ["ls"], "args": [], "description": "List every key", "default": true},
+    {"name": "info", "aliases": ["show"], "args": ["QUERY"], "description": "Look up one key (also: yk-key QUERY)"},
+    {"name": "current", "aliases": ["inserted"], "args": [], "description": "Show the inserted YubiKey"},
+    {"name": "add", "aliases": [], "args": [], "description": "Add a key interactively"},
+    {"name": "edit", "aliases": [], "args": ["QUERY"], "description": "Edit a key interactively"},
+    {"name": "rm", "aliases": ["delete", "remove"], "args": ["QUERY"], "description": "Remove a key"},
+    {"name": "git", "aliases": [], "args": ["[QUERY]"], "description": "Show or set Git user.signingkey"},
+    {"name": "help", "aliases": [], "args": [], "description": "Show this help"}
+  ],
+  "options": [
+    {"short": "n", "long": "name", "aliases": [], "arg": null, "group": "output", "description": "Print only the key name"},
+    {"short": "f", "long": "fingerprint", "aliases": [], "arg": null, "group": "output", "description": "Print only the fingerprint"},
+    {"short": "s", "long": "serial", "aliases": [], "arg": null, "group": "output", "description": "Print only the serial number"},
+    {"short": "k", "long": "ssh-key", "aliases": [], "arg": null, "group": "output", "description": "Print only the SSH key path"},
+    {"short": "l", "long": "length", "aliases": [], "arg": "LEN", "group": "output", "description": "Fingerprint length: short (8), long (16), full (40)"},
+    {"short": null, "long": "short", "aliases": [], "arg": null, "group": "output", "description": "Shorthand for --length short (implies -f on info and current)"},
+    {"short": null, "long": "long", "aliases": [], "arg": null, "group": "output", "description": "Shorthand for --length long (implies -f on info and current)"},
+    {"short": null, "long": "full", "aliases": [], "arg": null, "group": "output", "description": "Shorthand for --length full (implies -f on info and current)"},
+    {"short": "N", "long": "by-name", "aliases": [], "arg": null, "group": "matching", "description": "Match names only"},
+    {"short": "F", "long": "by-fingerprint", "aliases": [], "arg": null, "group": "matching", "description": "Match fingerprints only (8, 16 or 40 characters)"},
+    {"short": "S", "long": "by-serial", "aliases": [], "arg": null, "group": "matching", "description": "Match serials only"},
+    {"short": "g", "long": "global", "aliases": [], "arg": null, "group": "general", "description": "git: use the global Git config"},
+    {"short": "d", "long": "db", "aliases": [], "arg": "PATH", "group": "general", "description": "Use PATH as the database"},
+    {"short": "y", "long": "yes", "aliases": [], "arg": null, "group": "general", "description": "rm: do not ask for confirmation"},
+    {"short": "j", "long": "json", "aliases": [], "arg": null, "group": "general", "description": "Print JSON (list: an array; others: one object)"},
+    {"short": "q", "long": "silent", "aliases": ["quiet"], "arg": null, "group": "general", "description": "Print only the data"},
+    {"short": "C", "long": "no-color", "aliases": [], "arg": null, "group": "general", "description": "Disable coloured output"},
+    {"short": "V", "long": "version", "aliases": [], "arg": null, "group": "general", "description": "Print the version"},
+    {"short": "h", "long": "help", "aliases": [], "arg": null, "group": "general", "description": "Show this help"}
+  ]
+}'
+  if command -v jq >/dev/null 2>&1; then
+    printf '%s\n' "$_json" | jq .
+  else
+    printf '%s\n' "$_json"
+  fi
+}
+
+help_text() {
+  cat <<EOF
+${c_head}Usage:${c_reset} ${c_cmd}yk-key${c_reset} ${c_flag}[COMMAND]${c_reset} ${c_arg}[QUERY]${c_reset} ${c_dim}[OPTIONS]${c_reset}
+
+  Manage YubiKey GPG signing keys and the Git signing key.
+
+${c_head}Commands:${c_reset}
+  ${c_flag}list${c_reset}, ${c_flag}ls${c_reset}                List every key ${c_dim}(default)${c_reset}
+  ${c_flag}info${c_reset}, ${c_flag}show${c_reset} ${c_arg}QUERY${c_reset}        Look up one key ${c_dim}(also: yk-key QUERY)${c_reset}
+  ${c_flag}current${c_reset}, ${c_flag}inserted${c_reset}       Show the inserted YubiKey
+  ${c_flag}add${c_reset}                     Add a key interactively
+  ${c_flag}edit${c_reset} ${c_arg}QUERY${c_reset}              Edit a key interactively
+  ${c_flag}rm${c_reset}, ${c_flag}delete${c_reset} ${c_arg}QUERY${c_reset}        Remove a key
+  ${c_flag}git${c_reset} ${c_arg}[QUERY]${c_reset}             Show or set Git user.signingkey
+  ${c_flag}help${c_reset}                    Show this help
+
+${c_head}Output fields${c_reset} ${c_dim}(list, info, current, git):${c_reset}
+  ${c_flag}-n${c_reset}, ${c_flag}--name${c_reset}              Print only the key name
+  ${c_flag}-f${c_reset}, ${c_flag}--fingerprint${c_reset}       Print only the fingerprint
+  ${c_flag}-s${c_reset}, ${c_flag}--serial${c_reset}            Print only the serial number
+  ${c_flag}-k${c_reset}, ${c_flag}--ssh-key${c_reset}           Print only the SSH key path
+  ${c_flag}-l${c_reset}, ${c_flag}--length${c_reset} ${c_arg}LEN${c_reset}        Fingerprint length: ${c_arg}short${c_reset} (8), ${c_arg}long${c_reset} (16), ${c_arg}full${c_reset} (40)
+  ${c_flag}--short${c_reset}, ${c_flag}--long${c_reset}, ${c_flag}--full${c_reset}  Shorthand for ${c_flag}-l${c_reset} ${c_dim}(implies -f on info and current)${c_reset}
+
+${c_head}Query matching:${c_reset}
+  ${c_flag}-N${c_reset}, ${c_flag}--by-name${c_reset}           Match names only
+  ${c_flag}-F${c_reset}, ${c_flag}--by-fingerprint${c_reset}    Match fingerprints only (8, 16 or 40 characters)
+  ${c_flag}-S${c_reset}, ${c_flag}--by-serial${c_reset}         Match serials only
+
+${c_head}General:${c_reset}
+  ${c_flag}-g${c_reset}, ${c_flag}--global${c_reset}            git: use the global Git config
+  ${c_flag}-d${c_reset}, ${c_flag}--db${c_reset} ${c_arg}PATH${c_reset}           Use PATH as the database
+  ${c_flag}-y${c_reset}, ${c_flag}--yes${c_reset}               rm: do not ask for confirmation
+  ${c_flag}-j${c_reset}, ${c_flag}--json${c_reset}              Print JSON ${c_dim}(list: an array; others: one object)${c_reset}
+  ${c_flag}-q${c_reset}, ${c_flag}--silent${c_reset}, ${c_flag}--quiet${c_reset}   Print only the data
+  ${c_flag}-C${c_reset}, ${c_flag}--no-color${c_reset}          Disable coloured output
+  ${c_flag}-V${c_reset}, ${c_flag}--version${c_reset}           Print the version
+  ${c_flag}-h${c_reset}, ${c_flag}--help${c_reset}              Show this help
+
+${c_head}Database:${c_reset} ${c_arg}--db${c_reset}, else ${c_arg}\$YK_KEY_DB${c_reset}, else ${c_arg}\${XDG_CONFIG_HOME:-~/.config}/yk-key/cards.json${c_reset}
+EOF
+}
+
+# --------------------------------------------------------------- database ---
+
+# db_path [PATH]: the database path: PATH when not empty, else the first
+# that exists of $YK_KEY_DB and the XDG config path, else the first of them
+# (where add creates it).
+db_path() {
+  if [ -n "${1-}" ]; then
+    printf '%s\n' "$1"
+    return 0
+  fi
+  _xdg="${XDG_CONFIG_HOME:-$HOME/.config}/yk-key/cards.json"
+  case ${XDG_CONFIG_HOME-} in
+    /*) ;;
+    *) _xdg="$HOME/.config/yk-key/cards.json" ;; # the spec ignores relative paths
+  esac
+  if [ -n "${YK_KEY_DB-}" ]; then
+    if [ -f "$YK_KEY_DB" ] || [ ! -f "$_xdg" ]; then
+      printf '%s\n' "$YK_KEY_DB"
+      return 0
+    fi
+  fi
+  printf '%s\n' "$_xdg"
+}
+
+# Finds entries matching $q (already lowercased in jq) in the field $mode
+# picks: name, fingerprint (the full 40, last 16 or last 8 characters),
+# serial, or auto (any). Exact matches win; with none, substrings are
+# tried. Prints shell assignments for yk_match to eval.
+JQ_MATCH='
+def s(f): (f // "") | tostring;
+def Q: $q | ascii_downcase;
+def nm: s(.name) | ascii_downcase;
+def fp: s(.fingerprint) | ascii_downcase;
+def sr: s(.serial) | ascii_downcase;
+def fpx: fp as $f | Q as $x | ($f == $x or $f[-16:] == $x or $f[-8:] == $x);
+def exact:
+  if $mode == "name" then nm == Q
+  elif $mode == "fingerprint" then fpx
+  elif $mode == "serial" then sr == Q
+  else (nm == Q or fpx or sr == Q) end;
+def sub:
+  if $mode == "name" then (nm | contains(Q))
+  elif $mode == "fingerprint" then (fp | contains(Q))
+  elif $mode == "serial" then (sr | contains(Q))
+  else ((nm | contains(Q)) or (fp | contains(Q)) or (sr | contains(Q))) end;
+map(select(exact)) as $e
+| (if ($e | length) > 0 then $e else map(select(sub)) end) as $m
+| ($m[0] // {}) as $f
+| "m_count=\($m | length)",
+  @sh "m_name=\(s($f.name)) m_fp=\(s($f.fingerprint)) m_serial=\(s($f.serial)) m_ssh=\(s($f["ssh-key"]))",
+  @sh "m_amb=\([$m[] | @sh "_amb \(s(.name)) \(s(.fingerprint)) \(s(.serial))"] | join("\n"))"
+'
+
+# yk_match QUERY MODE: set m_count, the first match's m_name, m_fp,
+# m_serial and m_ssh, and m_amb (commands that list every match).
+yk_match() {
+  _out=$(jq -r --arg q "$1" --arg mode "$2" "$JQ_MATCH" "$db_file") || return 1
+  eval "$_out"
+}
+
+# match_one QUERY: yk_match against $match_mode, then fail unless exactly
+# one entry matched (edit, rm, git QUERY).
+match_one() {
+  yk_match "$(printf '%s' "$1" | tr -d ' ')" "$match_mode" || exit 1
+  if [ "$m_count" -ne 1 ]; then
+    qerr "yk-key: '$1' matches $m_count keys; it must match exactly one"
+    exit 1
+  fi
+}
+
+# write_db JQ_FILTER [JQ_ARGS]...: rewrite the database through jq, via a
+# temporary file beside it renamed into place, so an interrupted write never
+# leaves it half-written. A symlinked database is written at its target, so
+# the link survives.
+write_db() {
+  _filter=$1
+  shift
+  _real=$(real_path "$db_file")
+  _tmp=$(mktemp "$_real.XXXXXX") || exit 1
+  if ! jq "$@" "$_filter" "$_real" >"$_tmp" || ! mv -f -- "$_tmp" "$_real"; then
+    rm -f -- "$_tmp"
+    err "yk-key: could not write $db_file"
+    exit 1
+  fi
+}
+
+# real_path PATH: PATH with symlinks followed (up to 40 deep), using only
+# plain readlink, which GNU, busybox, BSD and macOS all have.
+real_path() {
+  _r=$1 _i=0
+  while [ -L "$_r" ] && [ "$_i" -lt 40 ]; do
+    _l=$(readlink -- "$_r") || break
+    case $_l in
+      /*) _r=$_l ;;
+      *) _r="$(dirname -- "$_r")/$_l" ;;
+    esac
+    _i=$((_i + 1))
+  done
+  printf '%s\n' "$_r"
+}
+
+# validate IGNORE_NAME NAME FP SERIAL SSH: reject an entry before it is
+# written; IGNORE_NAME is the entry being edited ('' when adding).
+validate() {
+  if [ -z "$2" ] || [ -z "$3" ] || [ -z "$4" ]; then
+    err "yk-key: name, fingerprint and serial are all required"
+    return 1
+  fi
+  case $(printf '%s' "$2" | tr '[:upper:]' '[:lower:]') in
+    list | ls | info | show | current | inserted | add | edit | rm | delete | remove | git | help)
+      err "yk-key: '$2' is a subcommand name and cannot name a key"
+      return 1
+      ;;
+  esac
+  case $2$5 in
+    *"$tab"* | *[[:cntrl:]]*)
+      err "yk-key: the name and SSH key path cannot contain control characters"
+      return 1
+      ;;
+  esac
+  if ! printf '%s\n' "$3" | grep -Eq '^[0-9A-Fa-f]{40}$'; then
+    err "yk-key: the fingerprint must be 40 hexadecimal characters (got ${#3})"
+    return 1
+  fi
+  if printf '%s\n' "$2" | grep -Eq '^[0-9A-Fa-f]{8,}$'; then
+    err "yk-key: '$2' looks like a hex serial or fingerprint; use a descriptive name"
+    return 1
+  fi
+  if [ "$2" = "$4" ] || [ "$2" = "$3" ] || [ "$4" = "$3" ]; then
+    err "yk-key: name, fingerprint and serial must all differ"
+    return 1
+  fi
+  _conflict=$(jq -r --arg ign "$1" --arg n "$2" --arg f "$3" --arg s "$4" '
+    def s(f): (f // "") | tostring | ascii_downcase;
+    [.[] | select(.name != $ign)
+      | select(
+          s(.name) == ($n | ascii_downcase) or
+          s(.fingerprint) == ($f | ascii_downcase) or
+          s(.fingerprint)[-16:] == ($f[-16:] | ascii_downcase) or
+          s(.serial) == ($s | ascii_downcase) or
+          s(.serial) == ($n | ascii_downcase)
+        ) | .name][0] // empty
+  ' "$db_file") || return 1
+  if [ -n "$_conflict" ]; then
+    err "yk-key: these values collide with the existing key '$_conflict'"
+    return 1
+  fi
+}
+
+# ------------------------------------------------------------------- card ---
+
+# inserted_card: set card_fp and card_serial from the inserted OpenPGP card.
+# The card reports its signature subkey; when that key is in the keyring the
+# primary key's fingerprint is used, which is what the database stores.
+# Returns 1 when gpg is missing or no card answers.
+inserted_card() {
+  card_fp='' card_serial=''
+  command -v gpg >/dev/null 2>&1 || return 1
+  _st=$(gpg --card-status --with-colons 2>/dev/null) || return 1
+  card_fp=$(printf '%s\n' "$_st" | sed -n 's/^fpr:\([0-9A-F]\{40\}\):.*/\1/p' | sed -n 1p)
+  card_serial=$(printf '%s\n' "$_st" | sed -n 's/^serial:\([0-9A-Fa-f]*\):.*/\1/p' | sed -n 1p)
+  if [ -n "$card_fp" ]; then
+    _primary=$(gpg --with-colons --list-keys -- "$card_fp" 2>/dev/null |
+      sed -n 's/^fpr:::::::::\([0-9A-F]\{40\}\):.*/\1/p' | sed -n 1p)
+    [ -n "$_primary" ] && card_fp=$_primary
+  fi
+  [ -n "$card_fp" ] || [ -n "$card_serial" ]
+}
+
+# ---------------------------------------------------------------- prompts ---
+
+# ask VAR PROMPT [DEFAULT]: read one line from the user into VAR. The
+# prompt goes to stderr, so --json output stays clean. Under bash on a
+# terminal the default is pre-filled and editable; elsewhere it is shown in
+# brackets and an empty answer keeps it. Exits 1 at end of input.
+ask() {
+  _var=$1 _prompt=$2 _def=${3-} _ans=''
+  # shellcheck disable=SC3045 # read -e -i only runs under bash
+  if [ -n "${BASH_VERSION-}" ] && [ -t 0 ] && [ -t 2 ]; then
+    IFS= read -r -e -i "$_def" -p "$_prompt" _ans || exit 1
+  else
+    if [ -n "$_def" ]; then
+      printf '%s%s[%s]%s ' "$_prompt" "$c_dim" "$_def" "$c_reset" >&2
+    else
+      printf '%s' "$_prompt" >&2
+    fi
+    IFS= read -r _ans || exit 1
+    [ -z "$_ans" ] && _ans=$_def
+  fi
+  eval "$_var=\$_ans"
+}
+
+# trim TEXT: TEXT without leading and trailing whitespace.
+trim() { printf '%s\n' "$1" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'; }
+
+# norm_id TEXT: TEXT trimmed, without spaces, in upper case (fingerprints
+# and serials).
+norm_id() { printf '%s' "$1" | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]'; }
+
+# norm_ssh TEXT: an SSH key path trimmed, with a leading ~ expanded; - or
+# nothing means none. Warns when no file is there.
+norm_ssh() {
+  _k=$(trim "$1")
+  [ "$_k" = - ] && _k=''
+  case $_k in
+    '~') _k=$HOME ;;
+    '~/'*) _k="$HOME/${_k#'~/'}" ;;
+  esac
+  if [ -n "$_k" ] && [ ! -f "$_k" ]; then
+    qerr "yk-key: warning: no file at $_k (saved anyway)" "$c_warn"
+  fi
+  printf '%s' "$_k"
+}
+
+# --------------------------------------------------------------- commands ---
+
+cmd_list() {
+  if [ "$is_json" -eq 1 ]; then
+    jq --arg field "$out_field" --arg len "$fp_len" '
+      def fmt: if $len == "short" then .[-8:] elif $len == "long" then .[-16:] else . end;
+      map({name, fingerprint: (.fingerprint | fmt), serial, "ssh-key": (.["ssh-key"] // null)})
+      | if $field == "all" then . else map({($field): .[$field]}) end
+    ' "$db_file"
+    return
+  fi
+  case $out_field in
+    name | serial | ssh-key)
+      jq -r --arg field "$out_field" '.[] | .[$field] // ""' "$db_file"
+      ;;
+    fingerprint)
+      jq -r --arg len "$fp_len" '
+        .[] | (.fingerprint // "") | if $len == "short" then .[-8:] elif $len == "long" then .[-16:] else . end
+      ' "$db_file"
+      ;;
+    *)
+      case $fp_len in
+        short) w=12 ;;
+        long) w=18 ;;
+        *) w=42 ;;
+      esac
+      if [ "$is_silent" -eq 0 ]; then
+        printf "%s%-14s %-${w}s %-10s %s%s\n" "$c_head" NAME FINGERPRINT SERIAL 'SSH KEY' "$c_reset"
+      fi
+      _row() {
+        if [ "$is_silent" -eq 1 ]; then
+          printf "%-14s %-${w}s %-10s %s\n" "$1" "$2" "$3" "$4"
+        else
+          printf "%s%-14s%s %s%-${w}s%s %s%-10s%s %s%s%s\n" \
+            "$c_hi" "$1" "$c_reset" "$c_arg" "$2" "$c_reset" "$c_accent" "$3" "$c_reset" "$c_dim" "$(tilde "$4")" "$c_reset"
+        fi
+      }
+      _rows=$(jq -r --arg len "$fp_len" '
+        def s(f): (f // "") | tostring;
+        def fmt: if $len == "short" then .[-8:] elif $len == "long" then .[-16:] else . end;
+        .[] | @sh "_row \(s(.name)) \(s(.fingerprint) | fmt) \(s(.serial)) \(s(.["ssh-key"]))"
+      ' "$db_file") || return 1
+      eval "$_rows"
+      ;;
+  esac
+  return 0
+}
+
+cmd_current() {
+  if ! command -v gpg >/dev/null 2>&1; then
+    err "yk-key: gpg is required to read the inserted card"
+    return 1
+  fi
+  if ! inserted_card; then
+    qerr "yk-key: no YubiKey or OpenPGP smartcard detected"
+    return 1
+  fi
+
+  m_count=0
+  [ -n "$card_fp" ] && { yk_match "$card_fp" fingerprint || return 1; }
+  if [ "$m_count" -eq 0 ] && [ -n "$card_serial" ]; then
+    yk_match "$card_serial" serial || return 1
+  fi
+
+  name=unlisted fp=$card_fp serial=$card_serial ssh='' c_name=$c_warn listed=0
+  if [ "$m_count" -eq 1 ]; then
+    name=$m_name fp=$m_fp serial=$m_serial ssh=$m_ssh c_name=$c_hi listed=1
+  elif [ "$is_json" -eq 0 ]; then
+    case $out_field in
+      name | ssh-key)
+        qerr "yk-key: the inserted card ($card_serial) is not in the database" "$c_warn"
+        return 1
+        ;;
+    esac
+  fi
+  fp=$(fmt_fp "$fp")
+
+  if [ "$is_json" -eq 1 ]; then
+    # An unlisted card has a null name and ssh-key.
+    [ "$listed" -eq 1 ] || name=''
+    emit_json "$out_field" "$name" "$fp" "$serial" "$ssh"
+    return
+  fi
+  if [ "$out_field" = all ]; then
+    print_entry "$c_name" "$name" "$fp" "$serial" "$ssh"
+  else
+    print_field "$name" "$fp" "$serial" "$ssh"
+  fi
+}
+
+cmd_info() {
+  yk_match "$(printf '%s' "$query" | tr -d ' ')" "$match_mode" || return 1
+  if [ "$m_count" -eq 0 ]; then
+    qerr "yk-key: no key matches '$c_hi$query$c_err'"
+    return 1
+  elif [ "$m_count" -gt 1 ]; then
+    if [ "$is_silent" -eq 0 ]; then
+      err "yk-key: '$query' matches $m_count keys (narrow it with $c_flag-N$c_err, $c_flag-F$c_err or $c_flag-S$c_err):"
+      _amb() {
+        printf '  %s%-12s%s %s%s%s %s%s%s\n' \
+          "$c_hi" "$1" "$c_reset" "$c_arg" "$2" "$c_reset" "$c_accent" "$3" "$c_reset" >&2
+      }
+      eval "$m_amb"
+    fi
+    return 1
+  fi
+
+  fp=$(fmt_fp "$m_fp")
+  if [ "$is_json" -eq 1 ]; then
+    emit_json "$out_field" "$m_name" "$fp" "$m_serial" "$m_ssh"
+    return
+  fi
+  print_field "$m_name" "$fp" "$m_serial" "$m_ssh"
+}
+
+cmd_add() {
+  if [ ! -f "$db_file" ]; then
+    mkdir -p -- "$(dirname -- "$db_file")" || return 1
+    echo '[]' >"$db_file" || return 1
+  fi
+
+  ask new_name "${c_hi}Key name (e.g. primary): $c_reset"
+  new_name=$(trim "$new_name")
+
+  inserted_card || :
+  if [ -n "$card_fp" ]; then
+    ask new_fp "${c_arg}Full 40-character fingerprint: $c_reset" "$card_fp"
+  else
+    ask new_fp "${c_arg}Full 40-character fingerprint (or a key ID in your keyring): $c_reset"
+  fi
+  new_fp=$(norm_id "$new_fp")
+
+  # Expand an 8- or 16-character key ID from the local keyring.
+  if [ "${#new_fp}" -lt 40 ] && [ -n "$new_fp" ] && command -v gpg >/dev/null 2>&1; then
+    _expanded=$(gpg --with-colons --list-keys -- "$new_fp" 2>/dev/null |
+      sed -n 's/^fpr:::::::::\([0-9A-F]\{40\}\):.*/\1/p' | grep -F -- "$new_fp" | sed -n 1p)
+    if [ -n "$_expanded" ]; then
+      [ "$is_silent" -eq 1 ] ||
+        printf '%sResolved the full fingerprint from the GPG keyring:%s %s%s%s\n' \
+          "$c_dim" "$c_reset" "$c_arg" "$_expanded" "$c_reset" >&2
+      new_fp=$_expanded
+    fi
+  fi
+
+  ask new_serial "${c_accent}Serial number: $c_reset" "$card_serial"
+  new_serial=$(norm_id "$new_serial")
+
+  # Default to the matching resident key when it exists.
+  _def_ssh=''
+  [ -n "$new_name" ] && [ -f "$HOME/.ssh/id_ed25519_sk_$new_name" ] && _def_ssh="$HOME/.ssh/id_ed25519_sk_$new_name"
+  ask new_ssh "${c_dim}SSH key path (optional): $c_reset" "$_def_ssh"
+  new_ssh=$(norm_ssh "$new_ssh")
+
+  validate '' "$new_name" "$new_fp" "$new_serial" "$new_ssh" || return 1
+  write_db '. += [{"name": $n, "fingerprint": $f, "serial": $s} + (if $k == "" then {} else {"ssh-key": $k} end)]' \
+    --arg n "$new_name" --arg f "$new_fp" --arg s "$new_serial" --arg k "$new_ssh"
+
+  if [ "$is_json" -eq 1 ]; then
+    emit_json all "$new_name" "$new_fp" "$new_serial" "$new_ssh" action=added
+  elif [ "$is_silent" -eq 0 ]; then
+    printf '%sAdded%s %s%s%s %s(%s%s%s | %s%s%s)%s\n' "$c_ok" "$c_reset" "$c_hi" "$new_name" "$c_reset" \
+      "$c_dim" "$c_arg" "$new_fp" "$c_dim" "$c_accent" "$new_serial" "$c_dim" "$c_reset"
+  fi
+}
+
+cmd_edit() {
+  match_one "$query"
+  old_name=$m_name
+
+  ask new_name "${c_hi}Key name: $c_reset" "$old_name"
+  new_name=$(trim "$new_name")
+  ask new_fp "${c_arg}Full 40-character fingerprint: $c_reset" "$m_fp"
+  new_fp=$(norm_id "$new_fp")
+  ask new_serial "${c_accent}Serial number: $c_reset" "$m_serial"
+  new_serial=$(norm_id "$new_serial")
+  ask new_ssh "${c_dim}SSH key path (optional, - for none): $c_reset" "$m_ssh"
+  new_ssh=$(norm_ssh "$new_ssh")
+
+  validate "$old_name" "$new_name" "$new_fp" "$new_serial" "$new_ssh" || return 1
+  write_db 'map(if .name == $old then {"name": $n, "fingerprint": $f, "serial": $s} + (if $k == "" then {} else {"ssh-key": $k} end) else . end)' \
+    --arg old "$old_name" --arg n "$new_name" --arg f "$new_fp" --arg s "$new_serial" --arg k "$new_ssh"
+
+  if [ "$is_json" -eq 1 ]; then
+    emit_json all "$new_name" "$new_fp" "$new_serial" "$new_ssh" action=updated
+  elif [ "$is_silent" -eq 0 ]; then
+    printf '%sUpdated%s %s%s%s %s(%s%s%s | %s%s%s)%s\n' "$c_ok" "$c_reset" "$c_hi" "$new_name" "$c_reset" \
+      "$c_dim" "$c_arg" "$new_fp" "$c_dim" "$c_accent" "$new_serial" "$c_dim" "$c_reset"
+  fi
+}
+
+cmd_rm() {
+  match_one "$query"
+  if [ "$opt_yes" -eq 0 ] && [ "$is_silent" -eq 0 ]; then
+    printf '%sDelete key '\''%s'\'' (%s | %s)? [y/N] %s' "$c_warn" "$m_name" "$m_fp" "$m_serial" "$c_reset" >&2
+    _confirm=''
+    IFS= read -r _confirm || :
+    case $_confirm in
+      [yY]*) ;;
+      *)
+        printf '%sAborted.%s\n' "$c_dim" "$c_reset" >&2
+        return 1
+        ;;
+    esac
+  fi
+  write_db 'map(select(.name != $n))' --arg n "$m_name"
+
+  if [ "$is_json" -eq 1 ]; then
+    emit_json all "$m_name" "$m_fp" "$m_serial" "$m_ssh" action=removed
+  elif [ "$is_silent" -eq 0 ]; then
+    printf '%sRemoved%s %s%s%s\n' "$c_ok" "$c_reset" "$c_hi" "$m_name" "$c_reset"
+  fi
+}
+
+cmd_git() {
+  if ! command -v git >/dev/null 2>&1; then
+    err "yk-key: git is required but not installed"
+    return 1
+  fi
+
+  if [ "$npos_query" -eq 0 ]; then
+    # --show-scope prints "SCOPE<tab>VALUE": the config the key Git uses
+    # actually comes from (local, global, system...).
+    if [ "$opt_global" -eq 1 ]; then
+      _found=$(git config --global --show-scope --get user.signingkey 2>/dev/null)
+    else
+      _found=$(git config --show-scope --get user.signingkey 2>/dev/null)
+    fi
+    scope_label=${_found%%"$tab"*}
+    current_id=${_found#*"$tab"}
+    if [ -z "$_found" ] || [ "$current_id" = "$_found" ] || [ -z "$current_id" ]; then
+      _where=''
+      [ "$opt_global" -eq 1 ] && _where='global '
+      qerr "yk-key: no ${_where}git user.signingkey is configured" "$c_warn"
+      return 1
+    fi
+
+    # A trailing ! pins a subkey; it is not part of the ID.
+    clean_id=$current_id
+    while :; do
+      case $clean_id in
+        *!) clean_id=${clean_id%!} ;;
+        *) break ;;
+      esac
+    done
+    yk_match "$clean_id" fingerprint || return 1
+    if [ "$m_count" -ne 1 ]; then
+      if [ "$is_json" -eq 1 ]; then
+        # Not in the database: only scope and signingkey are known.
+        emit_json "$out_field" '' '' '' '' "scope=$scope_label" "signingkey=$current_id"
+      elif [ "$is_silent" -eq 1 ]; then
+        printf '%s\n' "$current_id"
+      else
+        printf '%sActive (%s):%s %s%s%s %s(not in the database)%s\n' \
+          "$c_head" "$scope_label" "$c_reset" "$c_arg" "$current_id" "$c_reset" "$c_warn" "$c_reset"
+      fi
+      return 0
+    fi
+
+    if [ "$is_json" -eq 1 ]; then
+      emit_json "$out_field" "$m_name" "$(fmt_fp "$m_fp")" "$m_serial" "$m_ssh" \
+        "scope=$scope_label" "signingkey=$current_id"
+    elif [ "$is_silent" -eq 1 ]; then
+      case $out_field in
+        fingerprint) fmt_fp "$m_fp" ;;
+        serial) printf '%s\n' "$m_serial" ;;
+        ssh-key) printf '%s\n' "$m_ssh" ;;
+        *) printf '%s\n' "$m_name" ;;
+      esac
+    else
+      printf '%sActive (%s):%s %s%s%s  %ssigningkey=%s%s%s  %sfull=%s%s%s  %sserial=%s%s%s' \
+        "$c_head" "$scope_label" "$c_reset" "$c_hi" "$m_name" "$c_reset" \
+        "$c_dim" "$c_arg" "$current_id" "$c_reset" \
+        "$c_dim" "$c_arg" "$m_fp" "$c_reset" \
+        "$c_dim" "$c_accent" "$m_serial" "$c_reset"
+      [ -n "$m_ssh" ] && printf '  %sssh-key=%s%s' "$c_dim" "$(tilde "$m_ssh")" "$c_reset"
+      echo
+    fi
+    return 0
+  fi
+
+  match_one "$query"
+  signing_fp=$(fmt_fp "$m_fp")
+  if [ "$opt_global" -eq 1 ]; then
+    git config --global user.signingkey "$signing_fp" || return 1
+    scope_label=global
+  else
+    git config user.signingkey "$signing_fp" || return 1
+    scope_label=local
+  fi
+  if [ "$is_json" -eq 1 ]; then
+    emit_json "$out_field" "$m_name" "$m_fp" "$m_serial" "$m_ssh" \
+      action=set "scope=$scope_label" "signingkey=$signing_fp"
+  elif [ "$is_silent" -eq 0 ]; then
+    printf '%sSet %s git user.signingkey%s -> %s%s%s %s(%s%s%s | %s%s%s)%s\n' \
+      "$c_ok" "$scope_label" "$c_reset" "$c_hi" "$m_name" "$c_reset" \
+      "$c_dim" "$c_arg" "$signing_fp" "$c_dim" "$c_accent" "$m_serial" "$c_dim" "$c_reset"
+  fi
+}
+
+# ------------------------------------------------------------------- main ---
+
+# Help comes first, as in most tools: `help` as the first word, or -h or
+# --help anywhere before --.
+want_help=0 want_json=0
+[ "${1-}" = help ] && want_help=1
+for a in "$@"; do
+  case $a in
+    --) break ;;
+    -h | --help) want_help=1 ;;
+    -j | --json) want_json=1 ;;
+    -C | --no-color) NO_COLOR=1 ;;
+  esac
+done
+if [ "$want_help" -eq 1 ]; then
+  if [ "$want_json" -eq 1 ]; then
+    help_json
+    exit
+  fi
+  [ -t 1 ] || NO_COLOR=1
+  colors
+  help_text
+  exit 0
+fi
+
+# Options may come anywhere; short ones bundle (-qj) and take a value
+# attached or as the next word (-lshort, -l short); long ones as --db=PATH
+# or --db PATH.
+opt_silent=0 opt_color=1 opt_yes=0 opt_global=0 opt_db='' opt_length='' has_length=0
+opt_short=0 opt_long=0 opt_full=0 opt_name=0 opt_fp=0 opt_serial=0 opt_ssh=0 opt_json=0
+opt_by_name=0 opt_by_fp=0 opt_by_serial=0 opt_version=0 opt_help=0
+npos=0 p1='' p2=''
+
+usage_err() {
+  [ -t 2 ] || NO_COLOR=1
+  colors
+  err "yk-key: $1"
+  err "yk-key: try 'yk-key --help'"
+  exit 2
+}
+add_pos() {
+  npos=$((npos + 1))
+  case $npos in
+    1) p1=$1 ;;
+    2) p2=$1 ;;
+  esac
+}
+set_flag() {
+  case $1 in
+    q | silent | quiet) opt_silent=1 ;;
+    C | no-color) opt_color=0 ;;
+    y | yes) opt_yes=1 ;;
+    g | global) opt_global=1 ;;
+    short) opt_short=1 ;;
+    long) opt_long=1 ;;
+    full) opt_full=1 ;;
+    n | name) opt_name=1 ;;
+    f | fingerprint) opt_fp=1 ;;
+    s | serial) opt_serial=1 ;;
+    k | ssh-key) opt_ssh=1 ;;
+    j | json) opt_json=1 ;;
+    N | by-name) opt_by_name=1 ;;
+    F | by-fingerprint) opt_by_fp=1 ;;
+    S | by-serial) opt_by_serial=1 ;;
+    V | version) opt_version=1 ;;
+    h | help) opt_help=1 ;;
+    *) return 1 ;;
+  esac
+}
+set_value() {
+  case $1 in
+    d | db) opt_db=$2 ;;
+    l | length) opt_length=$2 has_length=1 ;;
+  esac
+}
+
+while [ $# -gt 0 ]; do
+  a=$1
+  shift
+  case $a in
+    --)
+      for a in "$@"; do add_pos "$a"; done
+      break
+      ;;
+    --*)
+      name=${a#--} hasval=0 val=''
+      case $name in
+        *=*) val=${name#*=} name=${name%%=*} hasval=1 ;;
+      esac
+      case $name in
+        db | length)
+          if [ "$hasval" -eq 0 ]; then
+            [ $# -gt 0 ] || usage_err "--$name: option requires an argument"
+            val=$1
+            shift
+          fi
+          set_value "$name" "$val"
+          ;;
+        *)
+          set_flag "$name" || usage_err "--$name: unknown option"
+          [ "$hasval" -eq 0 ] || usage_err "--$name: option does not take an argument"
+          ;;
+      esac
+      ;;
+    -?*)
+      rest=${a#-}
+      while [ -n "$rest" ]; do
+        c=${rest%"${rest#?}"}
+        rest=${rest#?}
+        case $c in
+          d | l)
+            if [ -n "$rest" ]; then
+              val=$rest rest=''
+            else
+              [ $# -gt 0 ] || usage_err "-$c: option requires an argument"
+              val=$1
+              shift
+            fi
+            set_value "$c" "$val"
+            ;;
+          *) set_flag "$c" || usage_err "-$c: unknown option" ;;
+        esac
+      done
+      ;;
+    *) add_pos "$a" ;;
+  esac
+done
+
+# A -h bundled with other flags (-qh) gets here.
+if [ "$opt_help" -eq 1 ]; then
+  [ "$opt_color" -eq 1 ] && [ -t 1 ] || NO_COLOR=1
+  colors
+  help_text
+  exit 0
+fi
+
+if [ "$opt_version" -eq 1 ]; then
+  printf 'yk-key %s\n' "$YK_KEY_VERSION"
+  exit 0
+fi
+
+if [ "$opt_color" -eq 0 ] || [ "$opt_json" -eq 1 ] || [ ! -t 1 ]; then
+  NO_COLOR=1
+fi
+colors
+
+is_silent=$opt_silent
+is_json=$opt_json
+
+# Fingerprint output length (default: full). --length wins over the
+# shorthands; among those, short, then long, then full.
+fp_len=full explicit_len=0
+if [ "$has_length" -eq 1 ]; then
+  explicit_len=1
+  case $(printf '%s' "$opt_length" | tr '[:upper:]' '[:lower:]') in
+    short | s | 8) fp_len=short ;;
+    long | l | 16) fp_len=long ;;
+    full | f | 40) fp_len=full ;;
+    *)
+      err "yk-key: invalid --length '$opt_length' (expected short, long, full, 8, 16 or 40)"
+      exit 2
+      ;;
+  esac
+elif [ "$opt_short" -eq 1 ]; then
+  fp_len=short explicit_len=1
+elif [ "$opt_long" -eq 1 ]; then
+  fp_len=long explicit_len=1
+elif [ "$opt_full" -eq 1 ]; then
+  fp_len=full explicit_len=1
+fi
+
+if ! command -v jq >/dev/null 2>&1; then
+  err "yk-key: jq is required but not installed"
+  exit 1
+fi
+
+db_file=$(db_path "$opt_db")
+
+# Subcommand; anything else is a QUERY for an implicit info.
+cmd=list query='' npos_query=0
+if [ "$npos" -ge 1 ]; then
+  case $p1 in
+    list | ls | info | show | current | inserted | add | edit | rm | delete | remove | git)
+      cmd=$p1
+      [ "$npos" -ge 2 ] && query=$p2 npos_query=1
+      ;;
+    *)
+      cmd=info query=$p1 npos_query=1
+      ;;
+  esac
+fi
+
+if [ "$cmd" != add ] && [ ! -f "$db_file" ]; then
+  qerr "yk-key: no database at $db_file (run '${c_cmd}yk-key add$c_err' to create it)"
+  exit 1
+fi
+
+case $cmd in
+  info | show | edit | rm | delete | remove)
+    if [ "$npos_query" -eq 0 ]; then
+      err "yk-key: usage: yk-key $cmd QUERY"
+      exit 2
+    fi
+    ;;
+esac
+
+match_mode=auto
+if [ "$opt_by_name" -eq 1 ]; then
+  match_mode=name
+elif [ "$opt_by_fp" -eq 1 ]; then
+  match_mode=fingerprint
+elif [ "$opt_by_serial" -eq 1 ]; then
+  match_mode=serial
+fi
+
+# Output field. A length shorthand on info or current with no other field
+# flag means "just the fingerprint".
+out_field=all
+if [ "$opt_name" -eq 1 ]; then
+  out_field=name
+elif [ "$opt_fp" -eq 1 ]; then
+  out_field=fingerprint
+elif [ "$opt_serial" -eq 1 ]; then
+  out_field=serial
+elif [ "$opt_ssh" -eq 1 ]; then
+  out_field='ssh-key'
+elif [ "$explicit_len" -eq 1 ]; then
+  case $cmd in
+    info | show | current | inserted) out_field=fingerprint ;;
+  esac
+fi
+
+case $cmd in
+  list | ls) cmd_list ;;
+  current | inserted) cmd_current ;;
+  info | show) cmd_info ;;
+  add) cmd_add ;;
+  edit) cmd_edit ;;
+  rm | delete | remove) cmd_rm ;;
+  git) cmd_git ;;
+esac
