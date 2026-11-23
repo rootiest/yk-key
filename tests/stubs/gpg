@@ -1,0 +1,36 @@
+#!/bin/sh
+# Stand-in for gpg in the tests. YK_TEST_CARD_FP / YK_TEST_CARD_SERIAL describe
+# the inserted card (unset: no card); YK_TEST_PRIMARY maps the card's
+# subkey to a primary key as "SUBKEY=PRIMARY".
+case " $* " in
+  *" --card-status "*)
+    [ -n "${YK_TEST_CARD_FP-}${YK_TEST_CARD_SERIAL-}" ] || { echo "gpg: selecting card failed: No such device" >&2; exit 2; }
+    case " $* " in
+      *" --with-colons "*)
+        echo "Reader:Test Reader:AID:D276000124010000000600000000000:openpgp-card:"
+        echo "serial:${YK_TEST_CARD_SERIAL-}:"
+        echo "fpr:${YK_TEST_CARD_FP-}::::"
+        ;;
+      *)
+        echo "Reader ...........: Test Reader"
+        echo "Serial number ....: ${YK_TEST_CARD_SERIAL-}"
+        ;;
+    esac
+    ;;
+  *" --list-keys "*)
+    for last; do :; done
+    sub=${YK_TEST_PRIMARY%%=*} prim=${YK_TEST_PRIMARY#*=}
+    if [ -n "${YK_TEST_PRIMARY-}" ] && [ "$last" = "$sub" ]; then
+      echo "pub:u:255:22:X:1:::u:::scESC:::::ed25519:::0:"
+      echo "fpr:::::::::$prim:"
+      echo "sub:u:255:22:Y:1::::::s::::::ed25519::"
+      echo "fpr:::::::::$sub:"
+      exit 0
+    fi
+    for fp in ${YK_TEST_KEYRING-}; do
+      case $fp in *"$last") echo "pub:u:255:22:X:1:::u:::scESC:::::ed25519:::0:"; echo "fpr:::::::::$fp:"; exit 0 ;; esac
+    done
+    exit 2
+    ;;
+  *) exit 2 ;;
+esac
