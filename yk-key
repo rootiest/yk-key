@@ -27,7 +27,7 @@
 # SC2016: jq programs are single-quoted on purpose. SC2088: ~ is printed, not
 # expanded. SC2154: m_* are assigned by eval in yk_match.
 # shellcheck disable=SC2016,SC2088,SC2154
-YK_KEY_VERSION=1.1.0
+YK_KEY_VERSION=1.1.1
 
 unset CDPATH
 tab=$(printf '\t')
@@ -42,7 +42,7 @@ colors() {
     return 0
   fi
   e=$(printf '\033')
-  c_reset="${e}[0m" c_cmd="${e}[94m" c_flag="${e}[92m" c_arg="${e}[36m"
+  c_reset="${e}[0m" c_cmd="${e}[94m" c_flag="${e}[92m" c_arg="${e}[34m"
   c_dim="${e}[90m" c_head="${e}[1;36m" c_warn="${e}[33m" c_err="${e}[31m"
   c_ok="${e}[32m" c_accent="${e}[32m" c_hi="${e}[1;37m"
 }
