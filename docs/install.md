@@ -24,8 +24,17 @@ curl -fsSLo ~/.local/bin/yk-key https://git.rootiest.dev/rootiest/yk-key/raw/tag
 
 ## Completions
 
-fish: copy `completions/yk-key.fish` to `~/.config/fish/completions/`. It completes key names from the database, honouring a
-`--db` already typed.
+`yk-key completion SHELL` prints a completion script; load it from your shell's startup files:
+
+| Shell | Add |
+|---|---|
+| bash | `source <(yk-key completion bash)` in `~/.bashrc` |
+| zsh | `source <(yk-key completion zsh)` in `~/.zshrc`, after `compinit` |
+| fish | `yk-key completion fish \| source` in `~/.config/fish/completions/yk-key.fish` (loaded the first time you complete `yk-key`) |
+
+They track whatever version of yk-key is installed, so there is nothing to update after an upgrade. To install a file instead,
+redirect the output: for zsh, save it as `_yk-key` in a directory on `$fpath`; for bash, as
+`~/.local/share/bash-completion/completions/yk-key`.
 
 ## Using an existing database
 

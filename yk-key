@@ -27,7 +27,7 @@
 # SC2016: jq programs are single-quoted on purpose. SC2088: ~ is printed, not
 # expanded. SC2154: m_* are assigned by eval in yk_match.
 # shellcheck disable=SC2016,SC2088,SC2154
-YK_KEY_VERSION=1.0.0
+YK_KEY_VERSION=1.1.0
 
 unset CDPATH
 tab=$(printf '\t')
@@ -135,6 +135,7 @@ help_json() {
     {"name": "edit", "aliases": [], "args": ["QUERY"], "description": "Edit a key interactively"},
     {"name": "rm", "aliases": ["delete", "remove"], "args": ["QUERY"], "description": "Remove a key"},
     {"name": "git", "aliases": [], "args": ["[QUERY]"], "description": "Show or set Git user.signingkey"},
+    {"name": "completion", "aliases": ["completions"], "args": ["bash|zsh|fish"], "description": "Print shell completions"},
     {"name": "help", "aliases": [], "args": [], "description": "Show this help"}
   ],
   "options": [
@@ -180,6 +181,7 @@ ${c_head}Commands:${c_reset}
   ${c_flag}edit${c_reset} ${c_arg}QUERY${c_reset}              Edit a key interactively
   ${c_flag}rm${c_reset}, ${c_flag}delete${c_reset} ${c_arg}QUERY${c_reset}        Remove a key
   ${c_flag}git${c_reset} ${c_arg}[QUERY]${c_reset}             Show or set Git user.signingkey
+  ${c_flag}completion${c_reset} ${c_arg}SHELL${c_reset}        Print completions for ${c_arg}bash${c_reset}, ${c_arg}zsh${c_reset} or ${c_arg}fish${c_reset}
   ${c_flag}help${c_reset}                    Show this help
 
 ${c_head}Output fields${c_reset} ${c_dim}(list, info, current, git):${c_reset}
@@ -318,7 +320,7 @@ validate() {
     return 1
   fi
   case $(printf '%s' "$2" | tr '[:upper:]' '[:lower:]') in
-    list | ls | info | show | current | inserted | add | edit | rm | delete | remove | git | help)
+    list | ls | info | show | current | inserted | add | edit | rm | delete | remove | git | completion | completions | help)
       err "yk-key: '$2' is a subcommand name and cannot name a key"
       return 1
       ;;
@@ -722,6 +724,245 @@ cmd_git() {
   fi
 }
 
+# ------------------------------------------------------------ completions ---
+# `yk-key completion SHELL` prints these. They ask yk-key itself for the key
+# names (honouring a --db already typed), through jq, which yk-key needs
+# anyway. Keep the command and option lists in step with help_text.
+
+completion_bash() {
+  cat <<'EOF'
+# bash completion for yk-key. Load it with: source <(yk-key completion bash)
+_yk_key() {
+  local cur=${COMP_WORDS[COMP_CWORD]} prev=${COMP_WORDS[COMP_CWORD-1]}
+  local cmds="list ls info show current inserted add edit rm delete remove git completion help"
+  local opts="-n --name -f --fingerprint -s --serial -k --ssh-key -l --length --short --long --full
+    -N --by-name -F --by-fingerprint -S --by-serial -g --global -d --db -y --yes -j --json
+    -q --silent --quiet -C --no-color -V --version -h --help"
+  local i w sub='' db='' npos=0
+  for ((i = 1; i < COMP_CWORD; i++)); do
+    w=${COMP_WORDS[i]}
+    case $w in
+      -d | --db) db=${COMP_WORDS[i + 1]}; ((i++)) ;;
+      -l | --length) ((i++)) ;;
+      --db=*) db=${w#--db=} ;;
+      -?*) ;;
+      *) [[ $npos -eq 0 ]] && sub=$w; ((npos++)) ;;
+    esac
+  done
+  db=${db/#\~/$HOME}
+
+  case $prev in
+    -l | --length) mapfile -t COMPREPLY < <(compgen -W "short long full" -- "$cur"); return ;;
+    -d | --db) compopt -o filenames 2>/dev/null; mapfile -t COMPREPLY < <(compgen -f -- "$cur"); return ;;
+  esac
+  if [[ $cur == -* ]]; then
+    mapfile -t COMPREPLY < <(compgen -W "$opts" -- "$cur")
+    return
+  fi
+  local words=''
+  if [[ $npos -eq 0 ]]; then
+    words="$cmds $(command yk-key ${db:+--db "$db"} list -n 2>/dev/null)"
+  elif [[ $npos -eq 1 ]]; then
+    case $sub in
+      info | show | edit | rm | delete | remove | git) words=$(command yk-key ${db:+--db "$db"} list -n 2>/dev/null) ;;
+      completion | completions) words="bash zsh fish" ;;
+    esac
+  fi
+  local IFS=$'\n'
+  mapfile -t COMPREPLY < <(compgen -W "${words//[[:space:]]/$'\n'}" -- "$cur")
+}
+complete -F _yk_key yk-key
+EOF
+}
+
+completion_zsh() {
+  cat <<'EOF'
+#compdef yk-key
+# zsh completion for yk-key. Load it with: source <(yk-key completion zsh)
+# (after compinit), or save it as _yk-key in a directory on $fpath.
+
+_yk_key_keys() {
+  local -a keys db
+  local i p
+  for (( i = 2; i < CURRENT; i++ )); do
+    case $words[i] in
+      -d | --db) p=${(Q)words[i+1]} ;;
+      --db=*) p=${(Q)words[i]#--db=} ;;
+      *) continue ;;
+    esac
+    [[ $p == '~/'* ]] && p=$HOME/${p#\~/}
+    db=(--db $p)
+  done
+  keys=(${(f)"$(command yk-key $db list --json --long 2>/dev/null |
+    command jq -r '.[] | "\(.name | gsub(":"; "\\:")):\(.fingerprint) | \(.serial)"' 2>/dev/null)"})
+  _describe -t keys 'key' keys
+}
+
+_yk_key() {
+  local curcontext=$curcontext state line ret=1
+  local -a cmds
+  cmds=(
+    'list:List every key (default)' 'ls:List every key'
+    'info:Look up one key' 'show:Look up one key'
+    'current:Show the inserted YubiKey' 'inserted:Show the inserted YubiKey'
+    'add:Add a key interactively' 'edit:Edit a key interactively'
+    'rm:Remove a key' 'delete:Remove a key' 'remove:Remove a key'
+    'git:Show or set Git user.signingkey'
+    'completion:Print shell completions' 'help:Show help'
+  )
+  _arguments -s -S \
+    '(-n --name -f --fingerprint -s --serial -k --ssh-key)'{-n,--name}'[print only the key name]' \
+    '(-n --name -f --fingerprint -s --serial -k --ssh-key)'{-f,--fingerprint}'[print only the fingerprint]' \
+    '(-n --name -f --fingerprint -s --serial -k --ssh-key)'{-s,--serial}'[print only the serial number]' \
+    '(-n --name -f --fingerprint -s --serial -k --ssh-key)'{-k,--ssh-key}'[print only the SSH key path]' \
+    '(-l --length --short --long --full)'{-l+,--length=}'[fingerprint length]:length:(short long full)' \
+    '(-l --length --short --long --full)--short[short 8-character key ID]' \
+    '(-l --length --short --long --full)--long[long 16-character key ID]' \
+    '(-l --length --short --long --full)--full[full 40-character fingerprint]' \
+    '(-N --by-name -F --by-fingerprint -S --by-serial)'{-N,--by-name}'[match names only]' \
+    '(-N --by-name -F --by-fingerprint -S --by-serial)'{-F,--by-fingerprint}'[match fingerprints only]' \
+    '(-N --by-name -F --by-fingerprint -S --by-serial)'{-S,--by-serial}'[match serials only]' \
+    '(-g --global)'{-g,--global}'[git: use the global Git config]' \
+    '(-d --db)'{-d+,--db=}'[use PATH as the database]:database:_files' \
+    '(-y --yes)'{-y,--yes}'[rm: do not ask]' \
+    '(-j --json)'{-j,--json}'[print JSON]' \
+    '(-q --silent --quiet)'{-q,--silent,--quiet}'[print only the data]' \
+    '(-C --no-color)'{-C,--no-color}'[disable coloured output]' \
+    '(- *)'{-V,--version}'[print the version]' \
+    '(- *)'{-h,--help}'[show help]' \
+    '1: :->first' \
+    '2: :->second' \
+    '*:: :' && ret=0
+  case $state in
+    first)
+      _describe -t commands 'command' cmds && ret=0
+      _yk_key_keys && ret=0
+      ;;
+    second)
+      case $line[1] in
+        info | show | edit | rm | delete | remove | git) _yk_key_keys && ret=0 ;;
+        completion | completions) _values 'shell' bash zsh fish && ret=0 ;;
+      esac
+      ;;
+  esac
+  return ret
+}
+
+if [ "$funcstack[1]" = _yk_key ] || [ "$funcstack[1]" = _yk-key ]; then
+  _yk_key "$@"
+else
+  compdef _yk_key yk-key
+fi
+EOF
+}
+
+completion_fish() {
+  cat <<'EOF'
+# fish completion for yk-key. Load it with: yk-key completion fish | source
+# (for example from ~/.config/fish/completions/yk-key.fish, so it loads on
+# first use).
+
+# The words typed so far that are not options: the command, then its QUERY.
+function __yk_key_args
+    set -l tokens (commandline -xpc)
+    set -e tokens[1]
+    set -l skip 0
+    for t in $tokens
+        if test $skip -eq 1
+            set skip 0
+        else if contains -- $t -d --db -l --length
+            set skip 1
+        else if not string match -q -- '-?*' $t
+            echo $t
+        end
+    end
+end
+
+# __yk_key_at N [WORD...]: N words are typed (and, given WORDs, the first is
+# one of them).
+function __yk_key_at
+    set -l args (__yk_key_args)
+    test (count $args) -eq $argv[1]; or return
+    test (count $argv) -eq 1; or contains -- $args[1] $argv[2..]
+end
+
+# Keys in the database yk-key would read, honouring a --db/-d already typed.
+function __yk_key_entries
+    set -l tokens (commandline -xpc)
+    set -e tokens[1]
+    argparse -i 'd/db=' -- $tokens 2>/dev/null; or return
+    set -l db_args
+    set -q _flag_db; and set db_args --db $_flag_db
+    command yk-key list --json --long $db_args 2>/dev/null \
+        | command jq -r '.[] | "\(.name)\t\(.fingerprint) | \(.serial)"' 2>/dev/null
+end
+
+complete -c yk-key -e
+complete -c yk-key -f
+
+set -l __yk_none "__yk_key_at 0"
+complete -c yk-key -n $__yk_none -a list -d 'List every key (default)'
+complete -c yk-key -n $__yk_none -a ls -d 'List every key'
+complete -c yk-key -n $__yk_none -a info -d 'Look up one key'
+complete -c yk-key -n $__yk_none -a show -d 'Look up one key'
+complete -c yk-key -n $__yk_none -a current -d 'Show the inserted YubiKey'
+complete -c yk-key -n $__yk_none -a inserted -d 'Show the inserted YubiKey'
+complete -c yk-key -n $__yk_none -a add -d 'Add a key interactively'
+complete -c yk-key -n $__yk_none -a edit -d 'Edit a key interactively'
+complete -c yk-key -n $__yk_none -a rm -d 'Remove a key'
+complete -c yk-key -n $__yk_none -a delete -d 'Remove a key'
+complete -c yk-key -n $__yk_none -a remove -d 'Remove a key'
+complete -c yk-key -n $__yk_none -a git -d 'Show or set Git user.signingkey'
+complete -c yk-key -n $__yk_none -a completion -d 'Print shell completions'
+complete -c yk-key -n $__yk_none -a help -d 'Show help'
+
+# Key names: a bare QUERY (an implicit info) or after a query subcommand.
+complete -c yk-key -n "$__yk_none; or __yk_key_at 1 info show edit rm delete remove git" -a '(__yk_key_entries)'
+complete -c yk-key -n '__yk_key_at 1 completion completions' -a 'bash zsh fish'
+
+set -l __yk_fields "$__yk_none; or __fish_seen_subcommand_from list ls info show current inserted git"
+complete -c yk-key -n $__yk_fields -s n -l name -d 'Print only the key name'
+complete -c yk-key -n $__yk_fields -s f -l fingerprint -d 'Print only the fingerprint'
+complete -c yk-key -n $__yk_fields -s s -l serial -d 'Print only the serial number'
+complete -c yk-key -n $__yk_fields -s k -l ssh-key -d 'Print only the SSH key path'
+complete -c yk-key -n $__yk_fields -s l -l length -x -a 'short\t"8 characters" long\t"16 characters" full\t"40 characters"' -d 'Fingerprint length'
+complete -c yk-key -n $__yk_fields -l short -d 'Short 8-character key ID'
+complete -c yk-key -n $__yk_fields -l long -d 'Long 16-character key ID'
+complete -c yk-key -n $__yk_fields -l full -d 'Full 40-character fingerprint'
+
+set -l __yk_queries "$__yk_none; or __fish_seen_subcommand_from info show edit rm delete remove git"
+complete -c yk-key -n $__yk_queries -s N -l by-name -d 'Match names only'
+complete -c yk-key -n $__yk_queries -s F -l by-fingerprint -d 'Match fingerprints only'
+complete -c yk-key -n $__yk_queries -s S -l by-serial -d 'Match serials only'
+
+complete -c yk-key -n '__fish_seen_subcommand_from git' -s g -l global -d 'Use the global Git config'
+complete -c yk-key -n '__fish_seen_subcommand_from rm delete remove' -s y -l yes -d 'Do not ask for confirmation'
+
+complete -c yk-key -s d -l db -r -F -d 'Use PATH as the database'
+complete -c yk-key -s j -l json -d 'Print machine-readable JSON'
+complete -c yk-key -s q -l silent -d 'Print only the data'
+complete -c yk-key -l quiet -d 'Print only the data'
+complete -c yk-key -s C -l no-color -d 'Disable coloured output'
+complete -c yk-key -s V -l version -d 'Print the version'
+complete -c yk-key -s h -l help -d 'Show help'
+EOF
+}
+
+# cmd_completion [SHELL]: print the completion script for SHELL (default:
+# the login shell, from $SHELL).
+cmd_completion() {
+  _sh=${1:-${SHELL##*/}}
+  case $_sh in
+    bash) completion_bash ;;
+    zsh) completion_zsh ;;
+    fish) completion_fish ;;
+    *)
+      err "yk-key: usage: yk-key completion bash|zsh|fish"
+      exit 2
+      ;;
+  esac
+}
+
 # ------------------------------------------------------------------- main ---
 
 # Help comes first, as in most tools: `help` as the first word, or -h or
@@ -892,6 +1133,14 @@ elif [ "$opt_long" -eq 1 ]; then
 elif [ "$opt_full" -eq 1 ]; then
   fp_len=full explicit_len=1
 fi
+
+# completion needs neither jq nor a database.
+case $p1 in
+  completion | completions)
+    cmd_completion "$p2"
+    exit 0
+    ;;
+esac
 
 if ! command -v jq >/dev/null 2>&1; then
   err "yk-key: jq is required but not installed"

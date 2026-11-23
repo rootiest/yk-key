@@ -5,7 +5,6 @@
 | Path | What |
 |---|---|
 | `yk-key` | The script: the one file that ships |
-| `completions/yk-key.fish` | fish completions |
 | `tests/run-tests.sh` | The test entry point (CI runs it) |
 | `tests/test-yk-key.sh` | Functional tests |
 | `tests/stubs/gpg` | A stand-in for gpg that the tests put first on `PATH` |
@@ -17,10 +16,10 @@
 ./tests/run-tests.sh
 ```
 
-It checks syntax (`sh -n`), runs shellcheck in `sh` mode when installed, checks the fish completion when fish is installed,
-then runs `tests/test-yk-key.sh` once for each installed shell among `sh`, `dash`, `bash` and `busybox sh` (`YK_SH` picks the
+It checks syntax (`sh -n`) and runs shellcheck in `sh` mode when installed, then runs `tests/test-yk-key.sh` once for each installed shell among `sh`, `dash`, `bash` and `busybox sh` (`YK_SH` picks the
 shell that runs yk-key). One shell is enough to pass locally; CI installs dash and busybox so every push is checked under all
-of them. To try one shell by hand:
+of them. The tests also check that each `yk-key completion` script parses in its shell (when that shell is installed) and drive
+the bash completion as bash would; CI installs zsh and fish for the parse checks. To try one shell by hand:
 
 ```sh
 YK_SH=dash sh tests/test-yk-key.sh

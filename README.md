@@ -23,7 +23,7 @@ install -m 755 yk-key ~/.local/bin/yk-key
 
 It needs `jq`; `current` and `add` use `gpg` to read the inserted card, and `git` needs `git`. The database lives at
 `${XDG_CONFIG_HOME:-~/.config}/yk-key/cards.json` unless `$YK_KEY_DB` or `--db` says otherwise. See
-[docs/install.md](docs/install.md) for completions, using an existing database, and pinning a copy inside another
+[docs/install.md](docs/install.md) for shell completions (`yk-key completion bash|zsh|fish`), using an existing database, and pinning a copy inside another
 repository.
 
 ## Build and test
